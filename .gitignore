@@ -7,3 +7,10 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+
+# local runtime database (sqlite)
+job_runtime.db
+job_runtime.db-*
+*.db
+*.db-wal
+*.db-shm
