@@ -7,7 +7,12 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from app.errors import ErrorCode, JobError
-from app.models import JobCancellationResponse, JobSubmitRequest, JobSubmitResponse
+from app.models import (
+    JobCancellationResponse,
+    JobSubmitRequest,
+    JobSubmitResponse,
+    QuotaUpdateRequest,
+)
 
 router = APIRouter(prefix="", tags=["jobs"])
 
@@ -45,6 +50,22 @@ async def cancel_job(job_id: str, request: Request):
 async def list_jobs(request: Request, limit: int = 100):
     jobs = await get_manager(request).list_jobs(limit)
     return {"items": [j.to_public_dict() for j in jobs]}
+
+
+@router.get("/scheduler/config")
+async def get_scheduler_config(request: Request):
+    """查看调度配置：全局并发上限、各类型并发额度、等待提升阈值。"""
+    return get_manager(request).get_scheduler_config()
+
+
+@router.put("/scheduler/quotas")
+async def update_type_quotas(body: QuotaUpdateRequest, request: Request):
+    """运行时调整类型并发额度（无需重启）。
+
+    只影响之后新领取的作业，已在执行的不被打断；值为 null 表示移除该类型的
+    额度限制。调整返回生效后的完整调度配置。
+    """
+    return get_manager(request).set_type_quotas(body.quotas)
 
 
 async def job_error_handler(request, exc: JobError) -> JSONResponse:

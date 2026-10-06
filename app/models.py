@@ -42,6 +42,36 @@ class FailureKind(str, Enum):
     TIMEOUT = "TIMEOUT"
 
 
+class Priority(str, Enum):
+    """作业优先级三档。数值越大越先被领取；同档按提交先后（FIFO）。"""
+
+    LOW = "low"
+    NORMAL = "normal"
+    HIGH = "high"
+
+
+# 优先级 -> 调度数值（存入数据库，便于 SQL 排序与等待提升比较）。
+PRIORITY_RANK: dict[Priority, int] = {
+    Priority.LOW: 1,
+    Priority.NORMAL: 5,
+    Priority.HIGH: 9,
+}
+
+# 等待提升（aging）后的生效优先级：超过 aging_after 的等待作业按 HIGH 对待。
+AGING_BOOST_RANK = PRIORITY_RANK[Priority.HIGH]
+
+DEFAULT_PRIORITY = Priority.NORMAL
+
+
+class QueueReason(str, Enum):
+    """等待中作业的排队原因（查询时实时计算，不落库）。"""
+
+    QUEUED = "queued"  # 正常排队，等全局并发空位
+    TYPE_QUOTA_FULL = "type_quota_full"  # 所属类型额度已满
+    WAITING_HIGHER_PRIORITY = "waiting_higher_priority"  # 有更高优先级作业排在前面
+    RETRY_BACKOFF = "retry_backoff"  # 重试退避中，尚未到下次可领取时间
+
+
 @dataclass
 class JobResult:
     """单次执行尝试的结果。"""
@@ -95,6 +125,8 @@ class JobRecord:
     max_attempts: int
     created_at: str
     updated_at: str
+    priority: int = PRIORITY_RANK[DEFAULT_PRIORITY]
+    queue_reason: str | None = None  # 仅查询时填充，不持久化
     not_before: str | None = None
     queued_deadline: str | None = None
     run_deadline: str | None = None
@@ -106,6 +138,15 @@ class JobRecord:
     failure_kind: str | None = None
     attempts: list[AttemptRecord] = field(default_factory=list)
 
+    @property
+    def priority_name(self) -> str:
+        """把存储的数值还原为三档名称（未知数值按区间归类）。"""
+        if self.priority >= PRIORITY_RANK[Priority.HIGH]:
+            return Priority.HIGH.value
+        if self.priority <= PRIORITY_RANK[Priority.LOW]:
+            return Priority.LOW.value
+        return Priority.NORMAL.value
+
     def to_public_dict(self) -> dict[str, Any]:
         return {
             "id": self.id,
@@ -116,6 +157,8 @@ class JobRecord:
             "terminal": self.state in TERMINAL_STATES,
             "attempt": self.attempt,
             "max_attempts": self.max_attempts,
+            "priority": self.priority_name,
+            "queue_reason": self.queue_reason,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "not_before": self.not_before,
@@ -140,6 +183,18 @@ class JobSubmitRequest(BaseModel):
     max_attempts: int | None = Field(default=None, ge=1, le=20)
     run_timeout: float | None = Field(default=None, gt=0, le=3600)
     queue_timeout: float | None = Field(default=None, gt=0, le=3600)
+    # 缺省为 None 时按 NORMAL 处理，老请求行为不变。
+    priority: Priority | None = Field(default=None)
+
+
+class QuotaUpdateRequest(BaseModel):
+    """运行时调整类型并发额度的请求体。
+
+    quotas: {作业类型: 并发额度}，额度为 >=0 的整数；0 表示暂停该类型新领取。
+    未列出的类型保持原额度；显式传 null 表示移除该类型的额度限制。
+    """
+
+    quotas: dict[str, int | None] = Field(default_factory=dict)
 
 
 class JobSubmitResponse(BaseModel):

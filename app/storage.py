@@ -14,6 +14,9 @@ from typing import Any
 
 from app.errors import ErrorCode
 from app.models import (
+    AGING_BOOST_RANK,
+    DEFAULT_PRIORITY,
+    PRIORITY_RANK,
     AttemptRecord,
     FailureKind,
     JobRecord,
@@ -39,6 +42,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     max_attempts INTEGER NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
+    priority INTEGER NOT NULL DEFAULT 5,
     not_before TEXT,
     queued_deadline TEXT,
     run_deadline TEXT,
@@ -63,6 +67,12 @@ CREATE TABLE IF NOT EXISTS job_attempts (
     PRIMARY KEY (job_id, attempt)
 );
 """
+
+# 生效优先级：排队超过 aging 阈值（created_at <= aging_cutoff）的作业按 HIGH 对待，
+# 保证等待过久的作业确定性地被提升，不会被无限期饿死。
+_EFFECTIVE_PRIORITY = (
+    f"CASE WHEN created_at <= ? THEN {AGING_BOOST_RANK} ELSE priority END"
+)
 
 
 class DuplicateIdempotencyKey(Exception):
@@ -110,6 +120,12 @@ def _row_to_job(cur: sqlite3.Cursor, row: sqlite3.Row) -> JobRecord:
         max_attempts=row["max_attempts"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+        # init_schema 已保证 priority 列存在（老库自动迁移，默认 NORMAL）。
+        priority=(
+            row["priority"]
+            if row["priority"] is not None
+            else PRIORITY_RANK[DEFAULT_PRIORITY]
+        ),
         not_before=row["not_before"],
         queued_deadline=row["queued_deadline"],
         run_deadline=row["run_deadline"],
@@ -143,12 +159,41 @@ class JobStorage(ABC):
         """统计等待中的作业数（PENDING/RETRY_WAIT，不含 RUNNING）。"""
 
     @abstractmethod
-    def claim_next(self, now_iso: str, run_deadline_iso: str) -> JobRecord | None:
-        """原子领取一个到期可执行的作业并置为 RUNNING。"""
+    def claim_next(
+        self,
+        now_iso: str,
+        run_deadline_iso: str,
+        excluded_types: frozenset[str] = frozenset(),
+        aging_cutoff_iso: str = "",
+    ) -> JobRecord | None:
+        """原子领取一个到期可执行的作业并置为 RUNNING。
+
+        领取顺序：生效优先级（含等待提升）高者优先，同档按 created_at 先到先取。
+        excluded_types 中的类型本轮不参与领取（类型额度已满）。
+        """
 
     @abstractmethod
-    def peek_next_due(self, now_iso: str) -> JobRecord | None:
-        """只读探测最早到期的等待作业（不加锁、不改变状态）。"""
+    def peek_next_due(
+        self,
+        now_iso: str,
+        excluded_types: frozenset[str] = frozenset(),
+        aging_cutoff_iso: str = "",
+    ) -> JobRecord | None:
+        """只读探测下一个将被领取的等待作业（不加锁、不改变状态）。"""
+
+    @abstractmethod
+    def count_running_by_type(self) -> dict[str, int]:
+        """统计各类型当前 RUNNING 的作业数，用于类型额度判定。"""
+
+    @abstractmethod
+    def has_higher_priority_waiting(
+        self,
+        priority: int,
+        created_at: str,
+        now_iso: str,
+        aging_cutoff_iso: str,
+    ) -> bool:
+        """是否存在排在该作业前面的到期等待作业（生效优先级更高，或同档更早提交）。"""
 
     @abstractmethod
     def compare_and_set_state(
@@ -217,6 +262,13 @@ class SqliteJobStorage(JobStorage):
     def init_schema(self) -> None:
         conn = self._connect()
         conn.executescript(_SCHEMA)
+        # 老库迁移：补充 priority 列（默认 NORMAL），既有行行为不变。
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(jobs)")}
+        if "priority" not in cols:
+            conn.execute(
+                "ALTER TABLE jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT "
+                f"{PRIORITY_RANK[DEFAULT_PRIORITY]}"
+            )
         conn.commit()
 
     def insert_job(self, job: JobRecord) -> None:
@@ -224,10 +276,10 @@ class SqliteJobStorage(JobStorage):
         try:
             conn.execute(
                 "INSERT INTO jobs (id, job_type, payload, idempotency_key, state, "
-                "attempt, max_attempts, created_at, updated_at, not_before, "
+                "attempt, max_attempts, created_at, updated_at, priority, not_before, "
                 "queued_deadline, run_deadline, started_at, finished_at, output, "
                 "error_code, error_message, failure_kind) VALUES (?,?,?,?,?,?,?,?,?,"
-                "?,?,?,?,?,?,?,?,?)",
+                "?,?,?,?,?,?,?,?,?,?)",
                 (
                     job.id,
                     job.job_type,
@@ -238,6 +290,7 @@ class SqliteJobStorage(JobStorage):
                     job.max_attempts,
                     job.created_at,
                     job.updated_at,
+                    job.priority,
                     job.not_before,
                     job.queued_deadline,
                     job.run_deadline,
@@ -282,14 +335,29 @@ class SqliteJobStorage(JobStorage):
         ).fetchone()
         return int(row["c"])
 
-    def claim_next(self, now_iso: str, run_deadline_iso: str) -> JobRecord | None:
-        """原子领取：把最早创建、当前仍未排队超时的到期作业置为 RUNNING。
+    @staticmethod
+    def _excluded_clause(excluded_types: frozenset[str]) -> tuple[str, list[str]]:
+        """生成类型排除子句；额度已满的类型本轮不参与领取。"""
+        if not excluded_types:
+            return "", []
+        placeholders = ",".join("?" for _ in excluded_types)
+        return f" AND job_type NOT IN ({placeholders})", sorted(excluded_types)
+
+    def claim_next(
+        self,
+        now_iso: str,
+        run_deadline_iso: str,
+        excluded_types: frozenset[str] = frozenset(),
+        aging_cutoff_iso: str = "",
+    ) -> JobRecord | None:
+        """原子领取：把生效优先级最高（同档最早提交）且未排队超时的到期作业置为 RUNNING。
 
         判定时间 now_iso 必须与本轮 timeout_queued_jobs 使用的为同一个值：
         timeout 取 queued_deadline <= now，claim 取 queued_deadline > now，
         二者互斥且穷尽，作业要么按排队超时进终态、要么被领取，不会丢失。
         run_deadline_iso 仅用于记录执行截止时间。
         """
+        excl_sql, excl_params = self._excluded_clause(excluded_types)
         conn = self._connect()
         cur = conn.execute(
             "UPDATE jobs SET state = ?, run_deadline = ?, "
@@ -297,8 +365,8 @@ class SqliteJobStorage(JobStorage):
             "WHERE id = ("
             "  SELECT id FROM jobs "
             "  WHERE state IN (?, ?) AND (not_before <= ?) AND "
-            "        queued_deadline > ? "
-            "  ORDER BY created_at ASC LIMIT 1"
+            "        queued_deadline > ?" + excl_sql + " "
+            "  ORDER BY " + _EFFECTIVE_PRIORITY + " DESC, created_at ASC LIMIT 1"
             ") RETURNING id",
             (
                 JobState.RUNNING.value,
@@ -309,6 +377,8 @@ class SqliteJobStorage(JobStorage):
                 JobState.RETRY_WAIT.value,
                 now_iso,
                 now_iso,
+                *excl_params,
+                aging_cutoff_iso,
             ),
         )
         row = cur.fetchone()
@@ -317,14 +387,67 @@ class SqliteJobStorage(JobStorage):
             return None
         return self.get_job(row["id"])
 
-    def peek_next_due(self, now_iso: str) -> JobRecord | None:
+    def peek_next_due(
+        self,
+        now_iso: str,
+        excluded_types: frozenset[str] = frozenset(),
+        aging_cutoff_iso: str = "",
+    ) -> JobRecord | None:
+        excl_sql, excl_params = self._excluded_clause(excluded_types)
         cur = self._connect().execute(
             "SELECT * FROM jobs WHERE state IN (?, ?) AND (not_before <= ?) "
-            "AND queued_deadline > ? ORDER BY created_at ASC LIMIT 1",
-            (JobState.PENDING.value, JobState.RETRY_WAIT.value, now_iso, now_iso),
+            "AND queued_deadline > ?" + excl_sql + " "
+            "ORDER BY " + _EFFECTIVE_PRIORITY + " DESC, created_at ASC LIMIT 1",
+            (
+                JobState.PENDING.value,
+                JobState.RETRY_WAIT.value,
+                now_iso,
+                now_iso,
+                *excl_params,
+                aging_cutoff_iso,
+            ),
         )
         row = cur.fetchone()
         return _row_to_job(cur, row) if row is not None else None
+
+    def count_running_by_type(self) -> dict[str, int]:
+        cur = self._connect().execute(
+            "SELECT job_type, COUNT(*) AS c FROM jobs WHERE state = ? "
+            "GROUP BY job_type",
+            (JobState.RUNNING.value,),
+        )
+        return {row["job_type"]: int(row["c"]) for row in cur.fetchall()}
+
+    def has_higher_priority_waiting(
+        self,
+        priority: int,
+        created_at: str,
+        now_iso: str,
+        aging_cutoff_iso: str,
+    ) -> bool:
+        """是否存在生效优先级更高、或同档但更早提交的到期等待作业。"""
+        my_eff = (
+            AGING_BOOST_RANK if created_at <= aging_cutoff_iso else priority
+        )
+        row = self._connect().execute(
+            "SELECT 1 FROM jobs WHERE state IN (?, ?) AND not_before <= ? "
+            "AND queued_deadline > ? AND ("
+            f"  ({_EFFECTIVE_PRIORITY}) > ? OR "
+            f"  (({_EFFECTIVE_PRIORITY}) = ? AND created_at < ?)"
+            ") LIMIT 1",
+            (
+                JobState.PENDING.value,
+                JobState.RETRY_WAIT.value,
+                now_iso,
+                now_iso,
+                aging_cutoff_iso,
+                my_eff,
+                aging_cutoff_iso,
+                my_eff,
+                created_at,
+            ),
+        ).fetchone()
+        return row is not None
 
     def compare_and_set_state(
         self,

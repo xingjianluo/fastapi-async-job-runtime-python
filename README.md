@@ -164,7 +164,80 @@ curl -s "http://127.0.0.1:8000/jobs?limit=50"
 
 ---
 
-## 5. 并发、排队与超时配置项
+## 5. 分级调度与类型隔离
+
+在既有能力之上叠加调度规则，**不改变状态机、终态语义与既有接口行为**。
+
+### 5.1 优先级
+
+- 提交时可带 `priority`：`"high" / "normal" / "low"` 三档；**缺省按 `normal`**
+  （老请求不带优先级行为不变，接口不报错）。
+- 领取顺序：**生效优先级高者优先，同档按提交先后（FIFO）**。跨作业类型不保证
+  严格全局排序（每个 worker 独立领取），但同类型内优先级效果确定可见。
+- 查询作业时返回 `priority` 字段（三档名称）。
+
+### 5.2 类型并发额度（隔离）
+
+- 每种作业类型可配置独立的并发额度：该类型同时执行的作业数不超过额度，
+  **不会因为别的类型占满全局并发而被连累**。
+- **全局 `JOB_MAX_CONCURRENCY` 仍是最外层硬约束**：各类型额度之和超过全局
+  上限时，以全局上限为准。
+- 未配置额度的类型不受类型额度限制，仅受全局上限约束。
+- 额度为 `0` 表示暂停该类型的新领取（已执行的不受影响）。
+
+**运行时调整（无需重启）**：
+
+```bash
+# 查看当前调度配置
+curl -s http://127.0.0.1:8000/scheduler/config
+# => {"max_concurrency": 4, "type_quotas": {"batch": 1}, "aging_after_seconds": 30.0}
+
+# 调整额度：batch 限 1 个并发，report 限 2 个
+curl -s -X PUT http://127.0.0.1:8000/scheduler/quotas \
+  -H 'Content-Type: application/json' \
+  -d '{"quotas": {"batch": 1, "report": 2}}'
+
+# 移除某个类型的额度限制（恢复为仅受全局上限约束）
+curl -s -X PUT http://127.0.0.1:8000/scheduler/quotas \
+  -H 'Content-Type: application/json' \
+  -d '{"quotas": {"batch": null}}'
+```
+
+调整**只影响之后新领取的作业**，已在执行的不被打断；初始额度也可用环境变量
+`JOB_TYPE_QUOTAS='{"batch": 1}'`（JSON 对象）配置。
+
+### 5.3 等待提升（防饿死）
+
+- 排队时间超过 `JOB_AGING_AFTER`（默认 30 秒）的作业，**生效优先级被提升为
+  `high`**，与原生 high 同档按 FIFO 竞争。
+- 规则确定且可解释：只要等待足够久，任何低优先级作业最终都会被提升，
+  不会被持续涌入的高优先级作业无限期饿死。
+
+### 5.4 排队原因（`queue_reason`）
+
+查询等待中（`PENDING/RETRY_WAIT`）的作业时，响应带 `queue_reason` 字段，
+实时计算、不落库：
+
+| queue_reason | 含义 |
+|---|---|
+| `queued` | 正常排队，等全局并发空位 |
+| `type_quota_full` | 所属类型的并发额度已满 |
+| `waiting_higher_priority` | 有更高生效优先级的作业排在前面 |
+| `retry_backoff` | 重试退避中，尚未到下次可领取时间 |
+| `null` | 非等待状态（执行中或终态） |
+
+### 5.5 与既有语义的兼容范围
+
+- 领取仍是单条条件 `UPDATE ... RETURNING` 原子完成，排序子句只影响
+  “选哪一个”，**同一作业不会被领取两次**。
+- 排队超时、取消、失败重试、重启恢复的状态流转不变；取消/超时释放出的
+  名额会立即唤醒 worker 重新按调度规则领取。
+- 额度调低不打断在执行作业；取消在执行作业后，同类型等待作业会被及时领取。
+- 幂等去重判定不看 `priority`：同键同载荷依旧去重命中，冲突判定不变。
+
+---
+
+## 6. 并发、排队与超时配置项
 
 均可通过环境变量覆盖（前缀 `JOB_`），也可在 `Settings(...)` 构造时注入
 （测试就是这样做的）。提交时还可对单个作业覆盖 `max_attempts`、
@@ -181,21 +254,25 @@ curl -s "http://127.0.0.1:8000/jobs?limit=50"
 | `JOB_RETRY_BASE_DELAY` | `0.2` 秒 | 指数退避基数 |
 | `JOB_RETRY_MAX_DELAY` | `5` 秒 | 退避上限 |
 | `JOB_POLL_INTERVAL` | `0.05` 秒 | worker/看门狗轮询间隔（同时用事件唤醒降低延迟） |
+| `JOB_AGING_AFTER` | `30` 秒 | 等待提升阈值：排队超过该时长按 high 对待 |
+| `JOB_TYPE_QUOTAS` | `{}` | 初始类型并发额度，JSON 对象，如 `{"batch": 1}` |
 
 单作业覆盖的安全上限：`run_timeout <= 3600s`、`queue_timeout <= 3600s`、
 `max_attempts <= 20`。
 
 ---
 
-## 6. HTTP 接口一览
+## 7. HTTP 接口一览
 
 | 方法 路径 | 说明 |
 |---|---|
 | `GET /` | 既有接口，返回 `{"Hello":"World"}`（行为不变） |
 | `POST /jobs` | 提交作业；请求体见下，返回 `id/state/deduplicated` |
-| `GET /jobs/{id}` | 查询作业（状态、输出、错误分类、每次尝试记录） |
+| `GET /jobs/{id}` | 查询作业（状态、输出、错误分类、尝试记录、优先级与排队原因） |
 | `POST /jobs/{id}/cancel` | 取消非终态作业 |
 | `GET /jobs?limit=` | 最近作业列表 |
+| `GET /scheduler/config` | 查看调度配置（全局并发、类型额度、等待提升阈值） |
+| `PUT /scheduler/quotas` | 运行时调整类型并发额度（`null` 表示移除限制） |
 
 `POST /jobs` 请求体：
 
@@ -206,23 +283,29 @@ curl -s "http://127.0.0.1:8000/jobs?limit=50"
   "idempotency_key": "optional-unique-key",
   "max_attempts": 3,
   "run_timeout": 60.0,
-  "queue_timeout": 300.0
+  "queue_timeout": 300.0,
+  "priority": "high"
 }
 ```
 
+`priority` 可选，取值 `"high"/"normal"/"low"`，缺省 `normal`。
+
 ---
 
-## 7. 本地验证
+## 8. 本地验证
 
 ```bash
-uv run pytest                      # 全部用例
-uv run pytest -o log_cli=true      # 同时在控制台打印作业日志
+uv run pytest                      # 全部用例（默认逐条显示用例结果与作业日志）
+uv run pytest -q                   # 只看汇总
 ```
 
-测试日志会打印**作业标识、状态变化、尝试次数与错误分类**，例如：
+测试日志会打印**作业标识、状态变化、调度原因（优先级/类型额度/等待提升）、
+尝试次数与错误分类**，以及每条用例的通过情况，例如：
 
 ```
-job=<id> attempt=1 state=-->PENDING 作业已提交并入队
+job=<id> attempt=1 state=-->PENDING 作业已提交并入队 priority=high
+job=<id> worker=0 领取作业 type=batch priority=high(9) boosted=False type_running=1/1 reason=优先级high
+job=<id> worker=1 领取作业 type=rec priority=low(1) boosted=True type_running=1/无限制 reason=等待提升
 job=<id> attempt=1 state=RUNNING->RETRY_WAIT RETRYABLE：0.030s 后重试
 job=<id> attempt=3 state=RUNNING->TIMED_OUT 执行超时且重试次数耗尽 error_code=ATTEMPT_TIMEOUT
 job=<id> state=QUEUED->TIMED_OUT 排队超过 queue_timeout，进入终态 error_code=QUEUE_TIMEOUT
@@ -230,6 +313,13 @@ job=<id> state=QUEUED->TIMED_OUT 排队超过 queue_timeout，进入终态 error
 
 测试覆盖（`tests/`）：
 
+- `test_scheduling.py`：同类型高优先级先领取、同档 FIFO、缺省优先级兼容、
+  类型额度隔离（占满不连累其它类型）、全局上限为硬约束、额度运行时调整
+  （调低不打断在执行、调大立即生效、额度 0 暂停）、取消释放类型额度、
+  等待提升防饿死、排队原因可区分（类型额度满/低优先级/退避）、
+  幂等判定不受优先级影响。
+- `test_scheduler_api.py`：HTTP 层带优先级提交、缺省优先级、非法优先级/额度
+  返回 422、额度查询与运行时调整、额度 0 暂停后经接口恢复执行。
 - `test_concurrent_submit.py`：同一幂等键 20 并发提交只建一个作业；
   冲突载荷并发提交的去重/冲突结论；8 并发取消只有一个生效。
 - `test_basic_and_idempotency.py`：提交成功、幂等去重、载荷/类型冲突、
@@ -243,6 +333,26 @@ job=<id> state=QUEUED->TIMED_OUT 排队超过 queue_timeout，进入终态 error
 - `test_error_classification.py`：`RETRYABLE / NON_RETRYABLE / TIMEOUT`
   在终态与每次尝试记录中一致可区分；四类终态互不相同；HTTP 错误码可区分。
 
+### 手动验证调度行为
+
+```bash
+JOB_DB_PATH=/tmp/demo.db uv run uvicorn main:app --port 8000
+
+# 限制 batch 类型只能并发 1 个
+curl -s -X PUT http://127.0.0.1:8000/scheduler/quotas \
+  -H 'Content-Type: application/json' -d '{"quotas": {"sleep": 1}}'
+
+# 连发两个长 batch 作业 + 一个高优先级 echo，观察：
+# - 第二个 sleep 排队且 queue_reason=type_quota_full
+# - echo 不受 sleep 额度影响，立即执行
+curl -s -X POST http://127.0.0.1:8000/jobs -H 'Content-Type: application/json' \
+  -d '{"job_type":"sleep","payload":{"seconds":10}}'
+curl -s -X POST http://127.0.0.1:8000/jobs -H 'Content-Type: application/json' \
+  -d '{"job_type":"sleep","payload":{"seconds":10}}'
+curl -s -X POST http://127.0.0.1:8000/jobs -H 'Content-Type: application/json' \
+  -d '{"job_type":"echo","priority":"high"}'
+```
+
 ### 手动验证重启持久化
 
 ```bash
@@ -253,17 +363,17 @@ JOB_DB_PATH=/tmp/demo.db uv run uvicorn main:app --port 8000
 
 ---
 
-## 8. 代码结构
+## 9. 代码结构
 
 ```
 app/
-  config.py     # Settings：并发/排队/超时/重试配置（环境变量）
+  config.py     # Settings：并发/排队/超时/重试/调度配置（环境变量）
   errors.py     # ErrorCode 与可区分的业务异常
-  models.py     # 状态机枚举、JobRecord/Attempt/请求响应模型、序列化
-  storage.py    # SQLite 存储：唯一幂等键、原子领取、CAS、重启恢复、排队超时
+  models.py     # 状态机枚举、优先级/排队原因、JobRecord/Attempt/请求响应模型
+  storage.py    # SQLite 存储：唯一幂等键、按优先级原子领取、CAS、重启恢复、排队超时
   handlers.py   # 内置作业类型与处理器注册、可取消的 ctx.sleep
-  manager.py    # 运行时核心：worker 池 + 看门狗 + 提交/查询/取消/重试
-  api.py        # FastAPI 路由与异常->HTTP 映射
+  manager.py    # 运行时核心：worker 池 + 看门狗 + 提交/查询/取消/重试 + 类型额度
+  api.py        # FastAPI 路由（作业 + 调度配置）与异常->HTTP 映射
 main.py         # create_app 装配与 lifespan（建表、启动恢复）
 tests/          # pytest / pytest-asyncio 用例
 ```

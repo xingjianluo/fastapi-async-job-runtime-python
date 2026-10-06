@@ -3,6 +3,13 @@
 并发模型：固定数量的 asyncio worker + SQLite 条件更新领取任务。
 SQLite 是唯一事实来源，内存事件仅用于唤醒 worker；进程崩溃后靠
 启动恢复（RUNNING -> PENDING）保证不丢失。
+
+调度规则（在既有能力之上叠加，不改变状态机与终态语义）：
+- 优先级：high/normal/low 三档，同类型内高档先领取，同档先提交先执行；
+- 类型隔离：每个作业类型可配置独立并发额度，额度只约束新领取，
+  全局 max_concurrency（worker 数）仍是最外层硬约束；
+- 等待提升（aging）：排队超过 aging_after_seconds 的作业按 HIGH 对待，
+  保证等待过久的作业确定性地被提前，不会被无限期饿死。
 """
 
 from __future__ import annotations
@@ -23,12 +30,15 @@ from app.errors import (
     AlreadyTerminal,
     ErrorCode,
     IdempotencyConflict,
+    JobError,
     JobNotFound,
     QueueFull,
     UnknownJobType,
 )
 from app.handlers import JobHandler
 from app.models import (
+    DEFAULT_PRIORITY,
+    PRIORITY_RANK,
     TERMINAL_STATES,
     AttemptRecord,
     FailureKind,
@@ -36,6 +46,7 @@ from app.models import (
     JobResult,
     JobState,
     JobSubmitRequest,
+    QueueReason,
 )
 from app.storage import DuplicateIdempotencyKey, JobStorage
 
@@ -69,6 +80,58 @@ class JobManager:
         self._wakeup = asyncio.Event()
         self._stop = asyncio.Event()
         self._started = False
+        # 类型并发额度：可在运行时调整，仅影响之后的新领取，不打断在执行作业。
+        self._type_quotas: dict[str, int] = dict(settings.type_quotas)
+
+    # ------------------------------------------------------------------ 调度配置
+
+    def get_scheduler_config(self) -> dict[str, Any]:
+        """当前调度配置快照：全局并发、各类型额度、等待提升阈值。"""
+        return {
+            "max_concurrency": self.settings.max_concurrency,
+            "type_quotas": dict(self._type_quotas),
+            "aging_after_seconds": self.settings.aging_after_seconds,
+        }
+
+    def set_type_quotas(self, quotas: dict[str, int | None]) -> dict[str, Any]:
+        """运行时调整类型额度。值为 None 表示移除该类型的额度限制。
+
+        只影响之后新领取的作业；已在执行的不被打断。调整后立即唤醒 worker，
+        让因额度放开的等待作业尽快被领取。
+        """
+        for job_type, quota in quotas.items():
+            if quota is None:
+                self._type_quotas.pop(job_type, None)
+                logger.info("类型额度移除：type=%s 不再受类型额度限制", job_type)
+                continue
+            if not isinstance(quota, int) or isinstance(quota, bool) or quota < 0:
+                raise JobError(
+                    f"类型 {job_type} 的额度必须是非负整数，收到 {quota!r}",
+                    error_code=ErrorCode.VALIDATION_ERROR,
+                    http_status=422,
+                )
+            old = self._type_quotas.get(job_type)
+            self._type_quotas[job_type] = quota
+            logger.info(
+                "类型额度调整：type=%s quota=%s->%d（仅影响新领取）",
+                job_type, old if old is not None else "无限制", quota,
+            )
+        self._notify()
+        return self.get_scheduler_config()
+
+    def _excluded_types(self) -> frozenset[str]:
+        """本轮领取中额度已满（或被暂停）的类型。"""
+        if not self._type_quotas:
+            return frozenset()
+        running = self.storage.count_running_by_type()
+        return frozenset(
+            t for t, quota in self._type_quotas.items()
+            if running.get(t, 0) >= quota
+        )
+
+    def _aging_cutoff(self, now: _dt.datetime) -> str:
+        """等待提升截止时间：created_at 早于该值的等待作业按 HIGH 对待。"""
+        return _iso_add_seconds(now, -self.settings.aging_after_seconds)
 
     # ------------------------------------------------------------------ 生命周期
 
@@ -159,6 +222,7 @@ class JobManager:
         if self.storage.count_waiting() >= self.settings.max_queue_size:
             raise QueueFull(self.settings.max_queue_size)
 
+        priority = request.priority or DEFAULT_PRIORITY
         now = _dt.datetime.now(_dt.UTC)
         now_iso = now.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
         job_id = uuid.uuid4().hex
@@ -172,6 +236,7 @@ class JobManager:
             max_attempts=max_attempts,
             created_at=now_iso,
             updated_at=now_iso,
+            priority=PRIORITY_RANK[priority],
             not_before=now_iso,
             queued_deadline=_iso_add_seconds(now, queue_timeout),
         )
@@ -185,7 +250,10 @@ class JobManager:
             assert existing is not None
             return self._resolve_idempotent(existing, request)
 
-        self._log_transition(job_id, "-", JobState.PENDING, 1, "作业已提交并入队")
+        self._log_transition(
+            job_id, "-", JobState.PENDING, 1, "作业已提交并入队",
+            priority=priority.value,
+        )
         self._notify()
         # 隐藏字段不对外暴露
         public_payload = {k: v for k, v in job.payload.items() if not k.startswith("__")}
@@ -213,7 +281,27 @@ class JobManager:
         job = self.storage.get_job(job_id)
         if job is None:
             raise JobNotFound(job_id)
+        job.queue_reason = self._queue_reason(job)
         return self._strip_internal(job)
+
+    def _queue_reason(self, job: JobRecord) -> str | None:
+        """等待中作业的排队原因（实时计算，不落库）；非等待状态返回 None。"""
+        if job.state not in (JobState.PENDING, JobState.RETRY_WAIT):
+            return None
+        now = _dt.datetime.now(_dt.UTC)
+        now_iso = now.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        if job.not_before is not None and job.not_before > now_iso:
+            return QueueReason.RETRY_BACKOFF.value
+        quota = self._type_quotas.get(job.job_type)
+        if quota is not None:
+            running = self.storage.count_running_by_type()
+            if running.get(job.job_type, 0) >= quota:
+                return QueueReason.TYPE_QUOTA_FULL.value
+        if self.storage.has_higher_priority_waiting(
+            job.priority, job.created_at, now_iso, self._aging_cutoff(now)
+        ):
+            return QueueReason.WAITING_HIGHER_PRIORITY.value
+        return QueueReason.QUEUED.value
 
     async def cancel(self, job_id: str) -> JobRecord:
         job = self.storage.get_job(job_id)
@@ -259,8 +347,11 @@ class JobManager:
         while not self._stop.is_set():
             job: JobRecord | None = None
             try:
-                now_iso = utcnow_iso()
-                candidate = self.storage.peek_next_due(now_iso)
+                now = _dt.datetime.now(_dt.UTC)
+                now_iso = now.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+                aging_cutoff = self._aging_cutoff(now)
+                excluded = self._excluded_types()
+                candidate = self.storage.peek_next_due(now_iso, excluded, aging_cutoff)
                 if candidate is None:
                     try:
                         await asyncio.wait_for(
@@ -273,13 +364,14 @@ class JobManager:
                 run_timeout = float(
                     candidate.payload.get("__run_timeout", self.settings.run_timeout)
                 )
-                run_deadline_iso = _iso_add_seconds(
-                    _dt.datetime.now(_dt.UTC), run_timeout
-                )
+                run_deadline_iso = _iso_add_seconds(now, run_timeout)
                 # claim 与看门狗的 timeout 收口互斥（deadline>now / <=now）。
-                job = self.storage.claim_next(now_iso, run_deadline_iso)
+                job = self.storage.claim_next(
+                    now_iso, run_deadline_iso, excluded, aging_cutoff
+                )
                 if job is None:
                     continue
+                self._log_claim(worker_id, job, aging_cutoff)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -304,6 +396,19 @@ class JobManager:
                 self._running.pop(job.id, None)
 
     # ------------------------------------------------------------------ 执行
+
+    def _log_claim(self, worker_id: int, job: JobRecord, aging_cutoff: str) -> None:
+        """领取留痕：优先级、是否被等待提升、类型额度占用，便于排查调度行为。"""
+        boosted = job.created_at <= aging_cutoff
+        quota = self._type_quotas.get(job.job_type)
+        running = self.storage.count_running_by_type().get(job.job_type, 0)
+        logger.info(
+            "job=%s worker=%d 领取作业 type=%s priority=%s(%d) boosted=%s "
+            "type_running=%d/%s reason=%s",
+            job.id, worker_id, job.job_type, job.priority_name, job.priority,
+            boosted, running, quota if quota is not None else "无限制",
+            "等待提升" if boosted else f"优先级{job.priority_name}",
+        )
 
     async def _run_job(self, job: JobRecord) -> None:
         run_timeout = float(job.payload.get("__run_timeout", self.settings.run_timeout))
