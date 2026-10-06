@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import Any, ClassVar
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class JobState(str, Enum):
@@ -40,6 +40,35 @@ class FailureKind(str, Enum):
     RETRYABLE = "RETRYABLE"
     NON_RETRYABLE = "NON_RETRYABLE"
     TIMEOUT = "TIMEOUT"
+
+
+class Priority:
+    """优先级档位（数值越大越优先）。老请求缺省为 NORMAL，行为不变。"""
+
+    LOW: ClassVar[int] = 1
+    NORMAL: ClassVar[int] = 2
+    HIGH: ClassVar[int] = 3
+
+    MIN: ClassVar[int] = LOW
+    MAX: ClassVar[int] = HIGH
+    DEFAULT: ClassVar[int] = NORMAL
+
+    NAMES: ClassVar[dict[int, str]] = {LOW: "LOW", NORMAL: "NORMAL", HIGH: "HIGH"}
+
+
+class QueueReason(str, Enum):
+    """作业仍在等待的调度原因（查询时现算，不落库）。
+
+    - QUEUED: 等待空闲的全局执行名额（worker 都被占满）
+    - TYPE_QUOTA_FULL: 所属类型的并发额度已占满
+    - PRIORITY_WAIT: 有更高（有效）优先级的到期作业排在前面
+    - RETRY_BACKOFF: 失败重试退避中，尚未到下次可执行时间
+    """
+
+    QUEUED = "QUEUED"
+    TYPE_QUOTA_FULL = "TYPE_QUOTA_FULL"
+    PRIORITY_WAIT = "PRIORITY_WAIT"
+    RETRY_BACKOFF = "RETRY_BACKOFF"
 
 
 @dataclass
@@ -95,6 +124,7 @@ class JobRecord:
     max_attempts: int
     created_at: str
     updated_at: str
+    priority: int = Priority.DEFAULT
     not_before: str | None = None
     queued_deadline: str | None = None
     run_deadline: str | None = None
@@ -105,6 +135,8 @@ class JobRecord:
     error_message: str | None = None
     failure_kind: str | None = None
     attempts: list[AttemptRecord] = field(default_factory=list)
+    # 查询时现算的调度等待原因（仅 PENDING/RETRY_WAIT 时有值），不落库。
+    queue_reason: str | None = None
 
     def to_public_dict(self) -> dict[str, Any]:
         return {
@@ -114,6 +146,9 @@ class JobRecord:
             "idempotency_key": self.idempotency_key,
             "state": self.state.value,
             "terminal": self.state in TERMINAL_STATES,
+            "priority": self.priority,
+            "priority_name": Priority.NAMES.get(self.priority, str(self.priority)),
+            "queue_reason": self.queue_reason,
             "attempt": self.attempt,
             "max_attempts": self.max_attempts,
             "created_at": self.created_at,
@@ -140,6 +175,10 @@ class JobSubmitRequest(BaseModel):
     max_attempts: int | None = Field(default=None, ge=1, le=20)
     run_timeout: float | None = Field(default=None, gt=0, le=3600)
     queue_timeout: float | None = Field(default=None, gt=0, le=3600)
+    # 优先级：1=低 2=普通（默认，老请求缺省行为不变）3=高
+    priority: int = Field(
+        default=Priority.DEFAULT, ge=Priority.MIN, le=Priority.MAX
+    )
 
 
 class JobSubmitResponse(BaseModel):
@@ -151,3 +190,24 @@ class JobSubmitResponse(BaseModel):
 class JobCancellationResponse(BaseModel):
     id: str
     state: JobState
+
+
+class QuotaUpdateRequest(BaseModel):
+    """整体替换类型并发额度的请求体。额度为 0 表示暂停该类型新领取。"""
+
+    quotas: dict[str, int] = Field(default_factory=dict)
+
+    @field_validator("quotas")
+    @classmethod
+    def _validate_quotas(cls, value: dict[str, int]) -> dict[str, int]:
+        for job_type, quota in value.items():
+            if not job_type:
+                raise ValueError("作业类型名不能为空")
+            if quota < 0 or quota > 10000:
+                raise ValueError(f"类型 {job_type!r} 的额度必须在 0..10000 之间")
+        return value
+
+
+class QuotaConfigResponse(BaseModel):
+    quotas: dict[str, int]
+    max_concurrency: int

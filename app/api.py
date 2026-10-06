@@ -7,7 +7,13 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from app.errors import ErrorCode, JobError
-from app.models import JobCancellationResponse, JobSubmitRequest, JobSubmitResponse
+from app.models import (
+    JobCancellationResponse,
+    JobSubmitRequest,
+    JobSubmitResponse,
+    QuotaConfigResponse,
+    QuotaUpdateRequest,
+)
 
 router = APIRouter(prefix="", tags=["jobs"])
 
@@ -47,18 +53,45 @@ async def list_jobs(request: Request, limit: int = 100):
     return {"items": [j.to_public_dict() for j in jobs]}
 
 
+@router.get("/scheduler/quotas", response_model=QuotaConfigResponse)
+async def get_quotas(request: Request):
+    """查看当前类型并发额度与全局并发上限。"""
+    manager = get_manager(request)
+    return QuotaConfigResponse(
+        quotas=manager.get_type_quotas(),
+        max_concurrency=manager.settings.max_concurrency,
+    )
+
+
+@router.put("/scheduler/quotas", response_model=QuotaConfigResponse)
+async def put_quotas(body: QuotaUpdateRequest, request: Request):
+    """整体替换类型并发额度，无需重启；仅影响之后新领取的作业。"""
+    manager = get_manager(request)
+    return QuotaConfigResponse(
+        quotas=manager.set_type_quotas(body.quotas),
+        max_concurrency=manager.settings.max_concurrency,
+    )
+
+
 async def job_error_handler(request, exc: JobError) -> JSONResponse:
     return JSONResponse(status_code=exc.http_status, content=exc.to_dict())
 
 
 async def validation_error_handler(request, exc: RequestValidationError) -> JSONResponse:
+    # pydantic 的 ctx 可能携带异常对象，需转成字符串后才能 JSON 序列化。
+    issues = []
+    for issue in exc.errors():
+        issue = dict(issue)
+        if "ctx" in issue:
+            issue["ctx"] = {k: str(v) for k, v in issue["ctx"].items()}
+        issues.append(issue)
     return JSONResponse(
         status_code=422,
         content={
             "error": {
                 "code": ErrorCode.VALIDATION_ERROR.value,
                 "message": "请求参数校验失败",
-                "details": {"issues": exc.errors()},
+                "details": {"issues": issues},
             }
         },
     )

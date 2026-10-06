@@ -3,6 +3,13 @@
 并发模型：固定数量的 asyncio worker + SQLite 条件更新领取任务。
 SQLite 是唯一事实来源，内存事件仅用于唤醒 worker；进程崩溃后靠
 启动恢复（RUNNING -> PENDING）保证不丢失。
+
+调度模型（在既有能力之上新增）：
+- 优先级：同类型内有效优先级高者先被领取，同档先提交先执行（FIFO）。
+- 类型隔离：每种作业类型可有独立并发额度，额度只约束新领取，
+  不打断已在执行的作业；全局 max_concurrency 仍是最外层硬约束。
+- 等待提升：等待超过 aging_threshold 的作业按确定规则提升有效优先级，
+  避免被无限期饿死。
 """
 
 from __future__ import annotations
@@ -36,8 +43,15 @@ from app.models import (
     JobResult,
     JobState,
     JobSubmitRequest,
+    Priority,
+    QueueReason,
 )
-from app.storage import DuplicateIdempotencyKey, JobStorage
+from app.storage import (
+    ClaimInfo,
+    DuplicateIdempotencyKey,
+    JobStorage,
+    effective_priority,
+)
 
 logger = logging.getLogger("job_runtime")
 
@@ -63,6 +77,8 @@ class JobManager:
         self.storage = storage
         self.handlers = handlers
         self.settings = settings
+        # 运行中可调整的类型并发额度（仅影响之后新领取的作业）。
+        self._type_quotas: dict[str, int] = dict(settings.type_quotas)
         self._workers: list[asyncio.Task[None]] = []
         self._watchdog: asyncio.Task[None] | None = None
         self._running: dict[str, asyncio.Task[None]] = {}
@@ -170,6 +186,7 @@ class JobManager:
             state=JobState.PENDING,
             attempt=1,
             max_attempts=max_attempts,
+            priority=request.priority,
             created_at=now_iso,
             updated_at=now_iso,
             not_before=now_iso,
@@ -185,7 +202,10 @@ class JobManager:
             assert existing is not None
             return self._resolve_idempotent(existing, request)
 
-        self._log_transition(job_id, "-", JobState.PENDING, 1, "作业已提交并入队")
+        self._log_transition(job_id, "-", JobState.PENDING, 1,
+                             "作业已提交并入队",
+                             priority=job.priority,
+                             priority_name=Priority.NAMES.get(job.priority, "?"))
         self._notify()
         # 隐藏字段不对外暴露
         public_payload = {k: v for k, v in job.payload.items() if not k.startswith("__")}
@@ -213,7 +233,56 @@ class JobManager:
         job = self.storage.get_job(job_id)
         if job is None:
             raise JobNotFound(job_id)
-        return self._strip_internal(job)
+        return self._strip_internal(self._attach_queue_reason(job))
+
+    # ------------------------------------------------------------------ 调度配置
+
+    def get_type_quotas(self) -> dict[str, int]:
+        """当前生效的类型并发额度（未列出的类型仅受全局并发约束）。"""
+        return dict(self._type_quotas)
+
+    def set_type_quotas(self, quotas: dict[str, int]) -> dict[str, int]:
+        """整体替换类型额度表，无需重启；仅影响之后新领取的作业。
+
+        已在执行的作业不受影响；额度调大后立即唤醒 worker 领取等待中的作业。
+        """
+        self._type_quotas = {str(k): max(0, int(v)) for k, v in quotas.items()}
+        logger.info(
+            "类型并发额度已调整 quotas=%s global_max_concurrency=%d（仅影响新领取）",
+            self._type_quotas, self.settings.max_concurrency,
+        )
+        self._notify()
+        return self.get_type_quotas()
+
+    # ------------------------------------------------------------------ 排队原因
+
+    def _attach_queue_reason(self, job: JobRecord) -> JobRecord:
+        """为等待中的作业现算调度原因（不落库）。"""
+        if job.state not in (JobState.PENDING, JobState.RETRY_WAIT):
+            return job
+        now_iso = utcnow_iso()
+        if job.not_before is not None and job.not_before > now_iso:
+            job.queue_reason = QueueReason.RETRY_BACKOFF.value
+            return job
+        quota = self._type_quotas.get(job.job_type)
+        if quota is not None:
+            running = self.storage.count_running_by_type().get(job.job_type, 0)
+            if running >= quota:
+                job.queue_reason = QueueReason.TYPE_QUOTA_FULL.value
+                return job
+        now = _dt.datetime.now(_dt.UTC)
+        aging = self.settings.aging_threshold
+        max_boost = self.settings.aging_max_boost
+        my_eff, _ = effective_priority(job, now, aging, max_boost)
+        for other in self.storage.list_due_waiting(now_iso):
+            if other.id == job.id:
+                continue
+            other_eff, _ = effective_priority(other, now, aging, max_boost)
+            if other_eff > my_eff:
+                job.queue_reason = QueueReason.PRIORITY_WAIT.value
+                return job
+        job.queue_reason = QueueReason.QUEUED.value
+        return job
 
     async def cancel(self, job_id: str) -> JobRecord:
         job = self.storage.get_job(job_id)
@@ -246,7 +315,10 @@ class JobManager:
         return self._strip_internal(self.storage.get_job(job_id))
 
     async def list_jobs(self, limit: int = 100) -> list[JobRecord]:
-        return [self._strip_internal(j) for j in self.storage.list_jobs(limit)]
+        return [
+            self._strip_internal(self._attach_queue_reason(j))
+            for j in self.storage.list_jobs(limit)
+        ]
 
     @staticmethod
     def _strip_internal(job: JobRecord) -> JobRecord:
@@ -260,8 +332,19 @@ class JobManager:
             job: JobRecord | None = None
             try:
                 now_iso = utcnow_iso()
-                candidate = self.storage.peek_next_due(now_iso)
-                if candidate is None:
+                claim: ClaimInfo | None = None
+                if self.storage.peek_next_due(now_iso) is not None:
+                    # claim 与看门狗的 timeout 收口互斥（deadline>now / <=now）。
+                    # 额度/优先级/等待提升的判定全部在 claim 事务内完成。
+                    claim = self.storage.claim_next(
+                        now_iso,
+                        run_deadline_for=self._run_deadline_for,
+                        type_quotas=self._type_quotas,
+                        aging_threshold=self.settings.aging_threshold,
+                        aging_max_boost=self.settings.aging_max_boost,
+                    )
+                if claim is None:
+                    # 无到期作业，或到期作业都被类型额度挡住：等唤醒或轮询。
                     try:
                         await asyncio.wait_for(
                             self._wakeup.wait(), timeout=self.settings.poll_interval
@@ -270,16 +353,8 @@ class JobManager:
                     except TimeoutError:
                         pass
                     continue
-                run_timeout = float(
-                    candidate.payload.get("__run_timeout", self.settings.run_timeout)
-                )
-                run_deadline_iso = _iso_add_seconds(
-                    _dt.datetime.now(_dt.UTC), run_timeout
-                )
-                # claim 与看门狗的 timeout 收口互斥（deadline>now / <=now）。
-                job = self.storage.claim_next(now_iso, run_deadline_iso)
-                if job is None:
-                    continue
+                job = claim.job
+                self._log_claim(worker_id, claim)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -304,6 +379,30 @@ class JobManager:
                 self._running.pop(job.id, None)
 
     # ------------------------------------------------------------------ 执行
+
+    def _run_deadline_for(self, job: JobRecord) -> str:
+        """claim 事务内回调：按被选中作业自己的 run_timeout 算执行截止时间。"""
+        run_timeout = float(
+            job.payload.get("__run_timeout", self.settings.run_timeout)
+        )
+        return _iso_add_seconds(_dt.datetime.now(_dt.UTC), run_timeout)
+
+    def _log_claim(self, worker_id: int, claim: ClaimInfo) -> None:
+        """领取留痕：记录调度原因（优先级 / 等待提升 / 类型额度占用）。"""
+        job = claim.job
+        if claim.type_quota is not None:
+            quota_txt = f"{claim.type_running + 1}/{claim.type_quota}"
+        else:
+            quota_txt = "unlimited"
+        reason = "优先级调度"
+        if claim.aging_boost > 0:
+            reason = f"等待提升+{claim.aging_boost}档"
+        logger.info(
+            "job=%s attempt=%d worker=%d 领取原因=%s priority=%d "
+            "effective_priority=%d aging_boost=%d type=%s type_quota=%s",
+            job.id, job.attempt, worker_id, reason, job.priority,
+            claim.effective_priority, claim.aging_boost, job.job_type, quota_txt,
+        )
 
     async def _run_job(self, job: JobRecord) -> None:
         run_timeout = float(job.payload.get("__run_timeout", self.settings.run_timeout))
